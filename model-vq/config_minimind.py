@@ -38,3 +38,16 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        ### Transformer-VQ specific configs
+        # 码本大小（短码数量 / 聚合缓存行数）
+        self.n_code = kwargs.get("n_code", 256)
+        # 未量化的滑动窗口键/值缓存长度（Transformer-VQ 论文中通常设为 block_len）
+        self.mem_len = kwargs.get("mem_len", 256)
+        # 分块长度：递归处理时每个 block 的长度
+        self.block_len = kwargs.get("block_len", 256)
+        # 是否把码本聚合缓存纳入注意力计算
+        self.agg_cache = kwargs.get("agg_cache", True)
+        # commitment loss 权重
+        self.c_beta = kwargs.get("c_beta", 0.25)
+        # 码本 EMA 的衰减系数
+        self.c_gamma = kwargs.get("c_gamma", 0.99)
