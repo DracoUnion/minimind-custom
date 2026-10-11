@@ -55,6 +55,265 @@ class RMSNorm(torch.nn.Module):
         return (self.weight * self.norm(x.float())).type_as(x)
 
 
+class RMSNormGated(torch.nn.Module):
+    """
+    门控 RMSNorm（Gated RMSNorm，来自 Qwen3.5 的 GatedDeltaNet 输出归一化）。
+
+    与普通 RMSNorm 的区别：输出还会乘一个由外部门 z 经激活得到的缩放因子:
+        out = RMSNorm(x) * gamma * SiLU(z)
+    让线性注意力的输出带一个逐位置的门控。
+    """
+    def __init__(self, hidden_size, eps=1e-6, activation="silu"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.activation = activation
+        self.act_fn = ACT2FN[activation]
+
+    def forward(self, hidden_states, gate):
+        input_dtype = hidden_states.dtype
+        h = hidden_states.to(torch.float32)
+        variance = h.pow(2).mean(-1, keepdim=True)
+        h = h * torch.rsqrt(variance + self.variance_epsilon)
+        h = self.weight * h.to(input_dtype)
+        h = h * self.act_fn(gate.to(torch.float32))
+        return h.to(input_dtype)
+
+
+# ==============================================================================
+# 线性注意力：门控 Delta 网络 (GatedDeltaNet, Qwen3.5 / Qwen3-Next 风格)
+# ==============================================================================
+
+def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+    """L2 归一化，与 FLA 库保持一致。"""
+    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+
+def causal_conv1d_fn(hidden_states, weight, bias, activation):
+    """
+    因果 1D 卷积（对 QKV 做短程局部混洗，DeltaNet 论文的关键组件之一）。
+    因果卷积：只在左侧补 kernel-1 个 0（右侧补 0），保证每个位置只看历史。
+
+    hidden_states: [batch, channels, seq]
+    weight:        [channels, 1, kernel] (groups=channels 的深度可分离卷积)
+    返回: [batch, channels, seq]
+    """
+    _, channels, seq_len = hidden_states.shape
+    padding = weight.shape[-1] - 1
+    out = F.conv1d(
+        F.pad(hidden_states.to(weight.dtype), (padding, 0)),  # 仅左侧补 padding 个 0
+        weight=weight.unsqueeze(1),
+        bias=bias,
+        padding=0,
+        groups=channels,
+    )
+    out = out[..., :seq_len]
+    if activation is not None:
+        out = ACT2FN[activation](out)
+    return out.to(hidden_states.dtype)
+
+
+def causal_conv1d_update(hidden_states, conv_state, weight, bias, activation):
+    """
+    单 token 增量解码的因果 1D 卷积。
+
+    conv_state: [B, channels, state_len] —— 保存的是前序各位置的 *卷积输入*
+    (未卷积的 mixed_qkv)，而非卷积输出。这样 [state, 新输入] 拼接后长度正好
+    为 kernel，可直接做零填充卷积，等价于对最近 kernel 个位置做全卷积。
+    会原地更新 conv_state（写入新的滑窗）。
+    """
+    _, hidden_size, seq_len = hidden_states.shape
+    state_len = conv_state.shape[-1]
+    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
+    conv_state.copy_(hidden_states_new[:, :, -state_len:])
+    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+    out = out[:, :, -seq_len:]
+    if activation is not None:
+        out = ACT2FN[activation](out)
+    return out.to(hidden_states.dtype)
+
+
+def torch_recurrent_gated_delta_rule(query, key, value, g, beta,
+                                     initial_state=None, output_final_state=False,
+                                     use_qk_l2norm_in_kernel=True, **kwargs):
+    """
+    门控 Delta 规则（单 token / 短序列的递归实现）。
+
+    每个时间步:
+        S_t = S_{t-1} * exp(g_t) + beta_t * (v_t - S_{t-1}·k_t) ⊗ k_t
+        o_t = S_t · q_t
+    对应 Qwen3.5 的 torch_recurrent_gated_delta_rule。
+    """
+    initial_dtype = query.dtype
+    batch_size, seq_len, _, k_head_dim = key.shape
+    num_v_heads, v_head_dim = value.shape[-2:]
+    decay = g
+
+    # 统一转成 [B, H, T, D] 并提升到 fp32
+    query, key, value, beta, decay = [
+        x.transpose(1, 2).to(dtype=torch.float32, memory_format=torch.contiguous_format)
+        for x in (query, key, value, beta, decay)
+    ]
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query)
+        key = l2norm(key)
+    query = query / (query.shape[-1] ** 0.5)
+
+    if initial_state is None:
+        state = torch.zeros(batch_size, num_v_heads, k_head_dim, v_head_dim,
+                            dtype=torch.float32, device=value.device)
+    else:
+        state = initial_state.to(dtype=torch.float32, device=value.device)
+    out = torch.zeros_like(value)
+
+    for i in range(seq_len):
+        q_t, k_t, v_t = query[:, :, i], key[:, :, i], value[:, :, i]
+        state = state * decay[:, :, i].exp()[..., None, None]
+        beta_t = beta[:, :, i].unsqueeze(-1)
+        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)              # [B, H, v]
+        delta = (v_t - kv_mem) * beta_t
+        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+    out = out.transpose(1, 2).contiguous().to(initial_dtype)
+    state = None if not output_final_state else state.to(initial_dtype)
+    return out, state
+
+
+class GatedDeltaNet(nn.Module):
+    """
+    门控 Delta 网络（线性注意力），Qwen3.5 风格，适配 MiniMind 接口。
+
+    组成（参照 Qwen3_5GatedDeltaNet）:
+    1. in_proj_qkv / in_proj_z / in_proj_b / in_proj_a 投影
+    2. 因果 1D 卷积 (conv1d) 对 QKV 做局部混洗
+    3. 门控 Delta 递归（torch_recurrent_gated_delta_rule）
+    4. 门控 RMSNorm 输出归一化 (z 作为门) + out_proj
+
+    状态缓存 (MiniMind 接口):
+        past = (kv_state, conv_state)
+        kv_state:   [B, num_v_heads, head_k_dim, head_v_dim] 递归状态
+        conv_state: [B, conv_dim, kernel-1] 卷积滑窗缓存
+    训练时 use_cache 下也返回状态，供自回归生成复用。
+    """
+    def __init__(self, config: MiniMindConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.activation = config.hidden_act
+
+        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = config.linear_num_key_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.num_rep = self.num_v_heads // self.num_k_heads
+
+        # 因果卷积
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim, out_channels=self.conv_dim,
+            bias=False, kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim, padding=self.conv_kernel_size - 1,
+        )
+        # 时步 (门控) 参数
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # 门控输出归一化
+        self.norm = RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps, activation=config.hidden_act)
+        self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
+
+        # 投影层
+        self.in_proj_qkv = nn.Linear(config.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
+        self.in_proj_z = nn.Linear(config.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
+
+        # 手动初始化卷积权重（kaiming 太深）
+        with torch.no_grad():
+            std = 1.0 / (self.conv_dim ** 0.5)
+            torch.nn.init.normal_(self.conv1d.weight, mean=0.0, std=std)
+
+    def _split_qkv(self, mixed_qkv, batch_size, seq_len):
+        # mixed_qkv: [B, T, conv_dim]
+        query, key, value = torch.split(
+            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        return query, key, value
+
+    def forward(self, x, past_state=None, use_cache=False, attention_mask=None):
+        batch_size, seq_len, _ = x.shape
+
+        # 1. 投影
+        mixed_qkv = self.in_proj_qkv(x)          # [B, T, conv_dim]
+        z = self.in_proj_z(x).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        b = self.in_proj_b(x)                     # [B, T, num_v_heads]
+        a = self.in_proj_a(x)
+
+        # 2. 因果卷积（更新卷积缓存）
+        # conv 缓存保存 *卷积输入* mixed_qkv 的最近 state_len 个位置（不足则左侧补 0）。
+        conv_w = self.conv1d.weight.squeeze(1)    # [conv_dim, kernel]
+        conv_b = self.conv1d.bias
+        state_len = self.conv_kernel_size - 1
+        mixed_qkv_in_t = mixed_qkv.transpose(1, 2)                 # [B, conv_dim, T] 卷积输入
+        if past_state is not None and past_state[1] is not None:
+            # 增量解码: [历史 state_len, 新输入 T] 拼接后做零填充卷积。
+            # causal_conv1d_update 会原地把 conv_state 滑到新窗口 (last state_len 个输入)。
+            conv_state = past_state[1]
+            mixed_qkv_t = causal_conv1d_update(mixed_qkv_in_t, conv_state, conv_w, conv_b, self.activation)
+            new_conv_state = conv_state  # 已被原地更新
+        else:
+            # 首次前向: 全序列卷积，末尾取 state_len 个卷积输入作为滑窗缓存（不足左侧补 0）
+            mixed_qkv_t = causal_conv1d_fn(mixed_qkv_in_t, conv_w, conv_b, self.activation)
+            if use_cache and state_len > 0:
+                tail = mixed_qkv_in_t[:, :, -state_len:]
+                left_pad = state_len - tail.shape[-1]
+                new_conv_state = F.pad(tail, (left_pad, 0)).contiguous()
+            else:
+                new_conv_state = None
+        mixed_qkv = mixed_qkv_t.transpose(1, 2)
+
+        query, key, value = self._split_qkv(mixed_qkv, batch_size, seq_len)
+
+        # 3. 门控参数
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        if self.num_rep > 1:
+            query = query.repeat_interleave(self.num_rep, dim=2)
+            key = key.repeat_interleave(self.num_rep, dim=2)
+
+        # 4. 门控 Delta 递归
+        kv_state = past_state[0] if (past_state is not None and past_state[0] is not None) else None
+        core_out, new_kv_state = torch_recurrent_gated_delta_rule(
+            query, key, value, g=g, beta=beta,
+            initial_state=kv_state,
+            output_final_state=use_cache,
+            use_qk_l2norm_in_kernel=True,
+        )
+        if use_cache:
+            past_out = (new_kv_state, new_conv_state)
+        else:
+            past_out = None
+
+        # 5. 门控归一化 + 输出投影
+        core_out = core_out.reshape(-1, self.head_v_dim)
+        core_out = self.norm(core_out, z.reshape(-1, self.head_v_dim))
+        core_out = core_out.reshape(batch_size, seq_len, self.value_dim)
+        return self.out_proj(core_out), past_out
+
+
+# ==============================================================================
+# RoPE 位置编码
+# ==============================================================================
+
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
     """
     预计算旋转位置编码 (RoPE) 的频率复数指数
@@ -413,19 +672,27 @@ class MOEFeedForward(nn.Module):
 
 class MiniMindBlock(nn.Module):
     """
-    MiniMind Transformer 块
+    MiniMind Transformer 块（线性 / 全注意力混合）
+
+    按 config.layer_types[layer_id] 选择 Token Mixer:
+      - "linear_attention": 门控 Delta 网络 (GatedDeltaNet，线性复杂度)
+      - "full_attention":   标准多头注意力 (Attention，全连接)
 
     架构 (Pre-Norm):
-    input → RMSNorm → Attention → +residual →
+    input → RMSNorm → (Attention | GatedDeltaNet) → +residual →
     RMSNorm → MLP (FFN/MoE) → +residual → output
 
-    Pre-Norm vs Post-Norm:
-    - Pre-Norm: LayerNorm 在残差连接之前，训练更稳定 (现代 LLM 常用)
-    - Post-Norm: LayerNorm 在残差连接之后
+    两种 mixer 的缓存类型不同:
+      - 全注意力层: past 为 (k, v) 张量
+      - 线性注意力层: past 为 (kv_state, conv_state) 张量
     """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.layer_type = config.layer_types[layer_id]
+        if self.layer_type == "linear_attention":
+            self.self_attn = GatedDeltaNet(config, layer_id)
+        else:  # "full_attention"
+            self.self_attn = Attention(config)
         # Attention 前的 LayerNorm
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # MLP 前的 LayerNorm
@@ -434,13 +701,22 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        # 1. 自注意力子层 (带残差连接)
+        # 1. Token Mixer 子层 (带残差连接)
         residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states),  # Pre-Norm
-            position_embeddings,
-            past_key_value, use_cache, attention_mask
-        )
+        if self.layer_type == "linear_attention":
+            # 线性注意力不依赖 RoPE，position_embeddings 透传即可
+            hidden_states, present_key_value = self.self_attn(
+                self.input_layernorm(hidden_states),
+                past_state=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+        else:
+            hidden_states, present_key_value = self.self_attn(
+                self.input_layernorm(hidden_states),  # Pre-Norm
+                position_embeddings,
+                past_key_value, use_cache, attention_mask
+            )
         hidden_states += residual  # 残差连接
 
         # 2. MLP 子层 (带残差连接)
@@ -508,8 +784,14 @@ class MiniMindModel(nn.Module):
         # 初始化 KV Cache 列表 (如果未提供)
         past_key_values = past_key_values or [None] * len(self.layers)
 
-        # 计算起始位置 (用于 KV Cache)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        # 计算起始位置 (用于 RoPE / KV Cache)。
+        # 全注意力层的缓存是逐步增长的 (k, v)，据此推断已生成长度；
+        # 线性注意力层的递归状态是定长的，不能用它推断位置。
+        start_pos = 0
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            if getattr(layer, 'layer_type', 'full_attention') == 'full_attention' and past_key_value is not None:
+                start_pos = past_key_value[0].shape[1]  # k 的长度
+                break
 
         # Token 嵌入
         hidden_states = self.dropout(self.embed_tokens(input_ids))
@@ -636,8 +918,14 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         # 自回归生成循环
         for _ in range(max_new_tokens):
-            # 计算已有缓存长度
-            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
+            # 计算已有缓存长度。
+            # 线性层的缓存是定长递归状态，不能推断位置；用全注意力层的 k 长度。
+            past_len = 0
+            if past_key_values:
+                for layer, pkv in zip(self.model.layers, past_key_values):
+                    if getattr(layer, 'layer_type', 'full_attention') == 'full_attention' and pkv is not None:
+                        past_len = pkv[0].shape[1]
+                        break
 
             # 前向传播 (只传入新 token)
             outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)

@@ -38,3 +38,27 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        ### 线性 / 全注意力混合 (QSA) specific configs
+        # 线性注意力（门控 Delta 网络）的头数与维度。
+        # 默认与 Qwen3-Next 的取值风格一致: 头数/维度可少于全注意力的 Q 头。
+        self.linear_num_value_heads = kwargs.get("linear_num_value_heads", 4)
+        self.linear_num_key_heads = kwargs.get("linear_num_key_heads", 4)
+        self.linear_key_head_dim = kwargs.get("linear_key_head_dim", 128)
+        self.linear_value_head_dim = kwargs.get("linear_value_head_dim", 128)
+        self.linear_conv_kernel_dim = kwargs.get("linear_conv_kernel_dim", 4)
+        # 每隔 full_attention_interval 层插入一层全注意力。
+        # 默认 4 → 序列 [linear, linear, linear, full, linear, ...]（3 线性 : 1 全）
+        self.linear_full_attn_layer = kwargs.get("linear_full_attn_layer", 4)
+        self.linear_attn_layer_interval = kwargs.get("linear_attn_layer_interval", 4)
+        # 每层类型: "linear_attention" / "full_attention"，按层索引访问。
+        # 若显式给出 layer_types，则直接使用；否则按上述间隔规则生成。
+        if kwargs.get("layer_types") is not None:
+            self.layer_types = list(kwargs["layer_types"])
+        else:
+            self.layer_types = [
+                "full_attention" if (i + 1) % self.linear_attn_layer_interval == 0
+                else "linear_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        assert len(self.layer_types) == self.num_hidden_layers, \
+            f"layer_types 长度 {len(self.layer_types)} 与 num_hidden_layers {self.num_hidden_layers} 不一致"
