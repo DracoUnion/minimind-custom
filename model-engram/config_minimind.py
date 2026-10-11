@@ -38,3 +38,22 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        ### Engram (n-gram hash 外部记忆) specific configs
+        # 是否启用 Engram 模块
+        self.use_engram = kwargs.get("use_engram", False)
+        # 在哪些层索引上插入 Engram
+        self.engram_layer_ids = kwargs.get("engram_layer_ids", [1, num_hidden_layers - 2] if num_hidden_layers >= 3 else [1])
+        # 最大 n-gram 阶数
+        self.engram_max_ngram_size = kwargs.get("engram_max_ngram_size", 3)
+        # 每个 n-gram 的 embedding 维度 / 头数
+        self.engram_n_embed_per_ngram = kwargs.get("engram_n_embed_per_ngram", 512)
+        self.engram_n_head_per_ngram = kwargs.get("engram_n_head_per_ngram", 8)
+        # 每个 n-gram 的头对应的哈希槽数（决定 codebook/嵌入表大小，按 n-gram 阶数排列）。
+        # 槽数取「向下的质数」，因此实际值可能略小于此。默认 512/1024，
+        # 对 MiniMind 这种小模型是合理量级；可按需增大以接近 Engram 论文的容量。
+        self.engram_vocab_size = kwargs.get("engram_vocab_size", [512, 1024][: (self.engram_max_ngram_size - 1)])
+        # 短卷积核 / 种子 / pad
+        self.engram_kernel_size = kwargs.get("engram_kernel_size", 4)
+        self.engram_seed = kwargs.get("engram_seed", 0)
+        # 哈希 pad 用的 token（默认 eos）
+        self.engram_pad_id = kwargs.get("engram_pad_id", self.eos_token_id)

@@ -408,6 +408,195 @@ class MOEFeedForward(nn.Module):
 
 
 # ==============================================================================
+# Engram 模块 (n-gram 哈希外部记忆)
+# ==============================================================================
+# 参考 doctool/engram_demo_v1.py。核心思想:
+#   对输入 token 序列做 n-gram 滚动哈希，把每个 n-gram 映射到一个 (n, head)
+#   的哈希槽，查一张可学习的大码本嵌入 (codebook embedding)，再用
+#   key/query 门控 + 短卷积 把查到的向量注入主干残差流。
+# 与 demo 的差异 (为适配 MiniMind 而做的简化):
+#   - 去掉 hyper-connection (原 demo 用 [B,L,HC_MULT,D] 多分支)，MiniMind
+#     主干是单分支 [B,L,D]，因此每个门控分支塌缩成单个 key/query。
+#   - 不依赖 AutoTokenizer 与 129k 词表的压缩 tokenizer；改为对 MiniMind
+#     自身的 input_ids 直接做 n-gram 哈希 (纯 torch，确定性、可离线)。
+#   - 所有超参从 MiniMindConfig 读取，而非模块级全局 dataclass。
+
+# 用于把每个 (n, head) 的哈希落到不同的质数模数上，避免槽位冲突。
+# 在构造时按需生成 (数量 = num_layers * (max_ngram-1) * n_head)。
+import numpy as np
+
+
+def _prime_list(count: int, start: int = 1_000_003):
+    """生成 >= start 的 count 个互不相同的质数（确定性、与 demo 一致的思路）。"""
+    from sympy import nextprime
+    primes, seen = [], set()
+    p = nextprime(start)
+    while len(primes) < count:
+        if p not in seen:
+            seen.add(p)
+            primes.append(int(p))
+        p = nextprime(p)
+    return primes
+
+
+def _ngram_hashes(input_ids: torch.Tensor, pad_id: int, max_ngram: int,
+                  multipliers: torch.Tensor, moduli: torch.Tensor,
+                  n_head: int) -> torch.Tensor:
+    """
+    计算 n-gram 滚动哈希。
+
+    参数:
+        input_ids : [B, T] 原始 token ids
+        pad_id    : 左填充用的 id (边界 n-gram 用 pad 占位)
+        max_ngram : 最大阶数 N
+        multipliers: [N] 每个位置权重的奇数乘子 (与 demo 的 layer_multipliers 一致)
+        moduli    : [(N-1)*n_head] 每个 (n, head) 的质数模数，按
+                    n 升序、head 升序排列 (前 n_head 个对应 n=2)
+        n_head    : 每个 n-gram 的哈希头数
+
+    返回:
+        [B, T, (N-1)*n_head] 的 int64 哈希 id 张量
+    """
+    B, T = input_ids.shape
+    device = input_ids.device
+    x = input_ids.to(device)
+
+    # 基础移位表: shifts[k] = 左移 k 位 (前 k 位填 pad_id)，恒为 [B, T]
+    shifts = []
+    for k in range(max_ngram):
+        if k == 0:
+            shifts.append(x)
+        else:
+            pad = x.new_full((B, min(k, T)), pad_id, dtype=x.dtype)
+            tail = x[:, :T - k] if T - k > 0 else x[:, :0]
+            # pad + tail 的宽度 = min(k,T) + max(0, T-k) = T
+            shifts.append(torch.cat([pad, tail], dim=-1))
+
+    head_hashes = []
+    # moduli 顺序: [n=2 的 n_head 个, n=3 的 n_head 个, ...]
+    for n in range(2, max_ngram + 1):
+        n_idx = n - 2
+        # 前 n 个位置做加权异或混合 (demo: mix = x0*m0 ^ x1*m1 ^ ...)
+        mix = shifts[0] * multipliers[0]
+        for k in range(1, n):
+            mix = torch.bitwise_xor(mix, shifts[k] * multipliers[k])
+        for j in range(n_head):
+            mod = int(moduli[n_idx * n_head + j])
+            head_hashes.append((mix % mod).to(torch.int64))
+    return torch.stack(head_hashes, dim=-1)   # [B, T, (N-1)*n_head]
+
+
+class MultiHeadEmbedding(nn.Module):
+    """
+    单张 Embedding 表，用偏移切分给不同的哈希头 (与 demo 一致)。
+    每个头有自己的槽数 N_j，total = sum(N_j)。
+    """
+    def __init__(self, list_of_N, D):
+        super().__init__()
+        self.num_heads = len(list_of_N)
+        self.embedding_dim = D
+        offsets = [0]
+        for n in list_of_N[:-1]:
+            offsets.append(offsets[-1] + n)
+        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+        self.embedding = nn.Embedding(num_embeddings=sum(list_of_N), embedding_dim=D)
+
+    def forward(self, input_ids):
+        # input_ids: [B, T, H]，offsets [H]
+        shifted = input_ids + self.offsets
+        return self.embedding(shifted)
+
+
+class Engram(nn.Module):
+    """
+    Engram 外部记忆模块 (单层)。
+
+    forward(hidden_states, input_ids):
+        hidden_states: [B, L, D]
+        input_ids:     [B, L]
+        返回: [B, L, D] 的 Engram 残差贡献
+    """
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        D = config.hidden_size
+        max_ngram = config.engram_max_ngram_size
+        n_head = config.engram_n_head_per_ngram
+        n_embed = config.engram_n_embed_per_ngram
+        D_head = n_embed // n_head
+        # 每个 (n, head) 的哈希槽数 (质数)。
+        # 默认按 engram_vocab_size 指定；若未给足，则用 3*3*3 的质数近似 (与 demo 量级一致)。
+        num_moduli = (max_ngram - 1) * n_head
+        self.vocab_per_ngram = config.engram_vocab_size
+        if len(self.vocab_per_ngram) != max_ngram - 1:
+            self.vocab_per_ngram = [256] * (max_ngram - 1)
+        # 取每个 n-gram 的槽数 (向下取最近质数)，生成对应模数
+        # 模数顺序: [n=2 的 n_head 个, n=3 的 n_head 个, ...]
+        moduli = []
+        for n_idx in range(max_ngram - 1):
+            base_prime = _prime_list(n_head, start=self.vocab_per_ngram[n_idx] - 1)[:n_head]
+            moduli.extend(base_prime)
+        self.register_buffer("moduli", torch.tensor(moduli, dtype=torch.int64))
+
+        # n-gram 混合用的奇数乘子 (每层一份，确定性随机)
+        rng = np.random.default_rng(config.engram_seed + 10007 * layer_id)
+        mult = (rng.integers(0, 1 << 62, size=max_ngram, dtype=np.int64) * 2 + 1) % (1 << 63)
+        self.register_buffer("multipliers", torch.tensor(mult, dtype=torch.int64))
+        self.pad_id = config.engram_pad_id
+
+        # 码本嵌入表: 每个 (n, head) 的槽数就是对应模数
+        list_of_N = [m for m in moduli]
+        self.multi_head_embedding = MultiHeadEmbedding(list_of_N, D_head)
+
+        engram_hidden = (max_ngram - 1) * n_embed
+        # 查码本后的向量维度
+        self.embed_dim = engram_hidden
+        # 门控: key (可学习投影) vs query (主干 hidden 经 key 投影)
+        self.key_proj = nn.Linear(engram_hidden, D, bias=False)
+        self.value_proj = nn.Linear(engram_hidden, D, bias=False)
+        self.norm_key = RMSNorm(D, eps=config.rms_norm_eps)
+        self.norm_query = RMSNorm(D, eps=config.rms_norm_eps)
+        # 短卷积 (沿序列)，dilation = max_ngram，匹配 n-gram 跨度。
+        # 因果卷积: 仅左侧补 (kernel-1)*dilation 个 0，因此用 padding=0 再手动左补。
+        self.short_conv = nn.Conv1d(
+            D, D, kernel_size=config.engram_kernel_size,
+            groups=D, bias=False, dilation=max_ngram,
+        )
+        self.conv_pad = (config.engram_kernel_size - 1) * max_ngram
+
+    def forward(self, hidden_states, input_ids):
+        """
+        hidden_states: [B, L, D]
+        input_ids:     [B, L]
+        返回: [B, L, D]
+        """
+        B, L, D = hidden_states.shape
+        # n-gram 哈希
+        hashes = _ngram_hashes(
+            input_ids, pad_id=self.pad_id,
+            max_ngram=self.config.engram_max_ngram_size,
+            multipliers=self.multipliers, moduli=self.moduli,
+            n_head=self.config.engram_n_head_per_ngram,
+        )                                          # [B, L, H']
+        embeddings = self.multi_head_embedding(hashes).flatten(start_dim=-2)  # [B, L, embed_dim]
+
+        # key / query 门控 (塌缩版: 单分支)
+        key = self.norm_key(self.key_proj(embeddings))
+        query = self.norm_query(hidden_states)
+        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(D)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gate = gate.sigmoid()                       # [B, L, 1]
+
+        value = gate * self.value_proj(embeddings)   # [B, L, D]
+        # 短卷积 (沿时间，因果): 左侧补 0
+        conv_in = value.transpose(1, 2)              # [B, D, L]
+        conv_in = F.pad(conv_in, (self.conv_pad, 0))  # 左侧补
+        conv_out = self.short_conv(conv_in)[..., :L].transpose(1, 2)
+        return value + conv_out
+
+
+# ==============================================================================
 # Transformer 块和完整模型
 # ==============================================================================
 
@@ -432,8 +621,16 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # 根据配置选择标准 FFN 或 MoE
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        # Engram 外部记忆 (可选): 在注意力之前把 n-gram 查到的向量残差注入
+        self.engram = Engram(layer_id, config) if (
+            getattr(config, 'use_engram', False) and layer_id in config.engram_layer_ids
+        ) else None
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None, input_ids=None):
+        # 0. Engram 残差注入 (如果该层启用了外部记忆)
+        if self.engram is not None and input_ids is not None:
+            hidden_states = hidden_states + self.engram(hidden_states, input_ids)
+
         # 1. 自注意力子层 (带残差连接)
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
@@ -520,6 +717,17 @@ class MiniMindModel(nn.Module):
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
+        # Engram 需要的是「当前窗口」的原始 token ids。
+        # 有 KV 缓存时 input_ids 只含新 token，n-gram 左移位会回看缓存中的
+        # 历史 token，因此用 start_pos 把完整 ids 对齐到当前窗口。
+        # 若 kwargs 提供了 full_input_ids (完整已生成序列，长度 = start_pos + seq_length)，
+        # 则从 start_pos 切片；否则退化为当前 input_ids (无法回看历史)。
+        engram_ids = kwargs.get('full_input_ids', None)
+        if engram_ids is not None and engram_ids.shape[1] >= start_pos + seq_length:
+            engram_ids = engram_ids[:, start_pos:]
+        else:
+            engram_ids = input_ids
+
         # 逐层前向传播
         presents = []
         for layer, past_key_value in zip(self.layers, past_key_values):
@@ -528,7 +736,8 @@ class MiniMindModel(nn.Module):
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
+                input_ids=engram_ids,
             )
             presents.append(present)
 
@@ -580,7 +789,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         返回:
             MoeCausalLMOutputWithPast 包含 loss, logits, past_key_values 等
         """
-        # 获取隐藏状态
+        # 获取隐藏状态。
+        # Engram 需要「当前窗口之前」的 token 上下文：把完整的 (可能更长的)
+        # 输入 ids 一并传入，模型内部按 start_pos 对齐到当前窗口。
+        if getattr(self.config, 'use_engram', False):
+            kwargs.setdefault('full_input_ids', input_ids)
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
 
         # 计算 logits (如果只保留部分，切片)
@@ -639,7 +852,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             # 计算已有缓存长度
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
 
-            # 前向传播 (只传入新 token)
+            # 前向传播 (只传入新 token)。
+            # Engram 需要左上下文，把完整的已生成序列作为 full_input_ids 传入，
+            # 模型内部按 start_pos 切出当前窗口。
+            if getattr(self.config, 'use_engram', False):
+                kwargs.setdefault('full_input_ids', input_ids)
             outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
 
             # 更新 attention_mask
