@@ -408,6 +408,304 @@ class MOEFeedForward(nn.Module):
 
 
 # ==============================================================================
+# Mamba2 选择性状态空间 (线性注意力层)
+# ==============================================================================
+# 参照 transformers 中 Nemotron H / Mamba2 的纯 PyTorch 实现 (无需 mamba-ssm /
+# causal-conv1d 内核, 训练与推理皆可)。核心思想:
+#   1. 输入投影 -> 拆成 [gate, conv_BC, dt]
+#   2. 因果 conv1d (对 BC 段)
+#   3. SSM 选择性扫描 (分块并行 + 可选递归增量)
+#   4. RMSNorm + 门控 (Zamba2 风格) -> 输出投影
+# 缓存: 每个 linear_attention 层维护 (conv_state, recurrent_state),
+#       conv_state 形状 (B, conv_dim, conv_kernel-1),
+#       recurrent_state 形状 (B, num_heads, head_dim, ssm_state_size)。
+
+
+def _silu(x):
+    return x * torch.sigmoid(x)
+
+
+class MambaMixer(nn.Module):
+    """
+    Mamba2 选择性状态空间混合器 (对应 config.layer_types 中的 "linear_attention")。
+
+    与 Attention 层地位对等: 都是 (x -> residual 分支), 但用线性复杂度的 SSM
+    替代 O(L^2) 注意力。
+    """
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.mamba_num_heads
+        self.head_dim = config.mamba_head_dim
+        self.intermediate_size = config.mamba_intermediate_size
+        self.ssm_state_size = config.ssm_state_size
+        self.conv_kernel = config.conv_kernel
+        self.chunk_size = config.chunk_size
+        self.n_groups = config.n_groups
+        self.activation = config.hidden_act  # 复用全局激活 (silu)
+        self.act = ACT2FN[config.hidden_act]
+
+        # conv 段通道数 = 中间维度 + 2 * 组数 * 状态维 (C, B 各一份)
+        self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
+        self.projection_size = self.intermediate_size + self.conv_dim + self.num_heads
+
+        # 1. 输入投影: 一个线性层同时产出 gate / conv_BC / dt
+        self.in_proj = nn.Linear(self.hidden_size, self.projection_size, bias=config.use_conv_bias)
+        # 2. 因果 conv1d (每个通道独立)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim, out_channels=self.conv_dim,
+            bias=config.use_conv_bias, kernel_size=self.conv_kernel,
+            padding=self.conv_kernel - 1, groups=self.conv_dim,
+        )
+        # 3. SSM 参数
+        # dt_bias: 每个头一个, 经 softplus 得到正的时间步
+        self.dt_bias = nn.Parameter(torch.zeros(self.num_heads))
+        # A: 衰减率, 取 -log(1..num_heads) 作为初始化 (数值稳定的负值)
+        A = torch.arange(1, self.num_heads + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(A))
+        # D: 每个头的直接跳连
+        self.D = nn.Parameter(torch.ones(self.num_heads))
+        # 4. RMSNorm (带门控): 逐头 RMSNorm 后与 gate 逐元素相乘 (Zamba2 风格)
+        self.norm = _GatedRMSNorm(self.intermediate_size, eps=config.layer_norm_eps)
+        # 5. 输出投影
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_conv_bias)
+
+    # ------------------------------------------------------------------
+    # 因果 conv1d
+    # ------------------------------------------------------------------
+    def _causal_conv1d(self, x, past_state=None):
+        """x: (B, conv_dim, L)。返回 (out (B, conv_dim, L), new_state (B, conv_dim, K-1))。"""
+        weight, bias = self.conv1d.weight, self.conv1d.bias
+        K = self.conv_kernel
+        if past_state is None:
+            out = F.conv1d(x, weight, bias, padding=K - 1, groups=self.conv_dim)
+            out = out[..., :x.shape[-1]]
+            # 末位状态 = 历史最后 K-1 个通道; 不足时用 0 补齐 (左侧补)
+            hist = x[..., -(K - 1):]
+            if hist.shape[-1] < (K - 1):
+                hist = F.pad(hist, (K - 1 - hist.shape[-1], 0))
+            new_state = hist.contiguous()
+        else:
+            full = torch.cat([past_state, x], dim=-1)
+            out = F.conv1d(full, weight, bias, padding=0, groups=self.conv_dim)
+            out = out[..., -x.shape[-1]:]
+            new_state = full[..., -(K - 1):].contiguous()
+        return out, new_state
+
+    def _causal_conv1d_update(self, x, conv_state):
+        """逐 token 增量 conv (生成阶段, L=1)。x: (B, conv_dim, 1)。"""
+        state_len = conv_state.shape[-1]
+        x_new = torch.cat([conv_state, x], dim=-1).to(self.conv1d.weight.dtype)
+        conv_state.copy_(x_new[:, :, -state_len:])
+        out = F.conv1d(x_new, self.conv1d.weight, self.conv1d.bias, padding=0, groups=x.shape[1])
+        out = out[:, :, -x.shape[-1]:]
+        return self.act(out.to(x.dtype))
+
+    # ------------------------------------------------------------------
+    # SSM 分块并行扫描 (训练 / 预填充)
+    # ------------------------------------------------------------------
+    def _chunk_scan(self, x, dt, A, B, C, D, initial_state=None):
+        """
+        x: (B, L, H, P)   SSM 输入
+        dt: (B, L, H)     时间步 (本函数内部再 softplus + 限幅)
+        A: (H,)           衰减率 (负值)
+        B,C: (B, L, G, N) SSM 矩阵 (G 组, N 状态维)
+        D: (H,)           直接跳连
+        initial_state: (B, H, P, N) 可选 (来自上一轮生成的末位状态)
+        返回 (out (B, L, H, P), final_state (B, H, P, N))
+
+        参照 mamba2_chunk_scan 的纯 PyTorch 版本:
+          - 块内用因果衰减核 O(chunk^2) 并行计算 (对角块)
+          - 块间用 O(1) 的递归传递末位状态 (off-diagonal 块)
+        头之间相互独立, 共享同一套衰减核。
+        """
+        Bsz, L, H, P = x.shape
+        G, N = B.shape[2], B.shape[3]
+        chunk = self.chunk_size
+
+        # 组 -> 头 广播 (每个头共用一个组的 B/C)
+        if G != H:
+            B = B.repeat_interleave(H // G, dim=2)
+            C = C.repeat_interleave(H // G, dim=2)
+
+        # dt 离散化: softplus + 限幅; 单步衰减 dA = exp(dt * A) (A 为负值)
+        dt = F.softplus(dt)
+        dt = torch.clamp(dt, min=self.config.time_step_min, max=self.config.time_step_max)
+        dA_step = torch.exp((dt * A.view(1, 1, H)).float())          # (B, L, H)
+
+        # 补齐到 chunk 整数倍 (在序列维 dim=1 上补; F.pad 从末维起给 pad 量)
+        pad = (-L) % chunk
+        if pad:
+            x = F.pad(x, (0, 0, 0, 0, 0, pad, 0, 0))    # x: (B,L,H,P)  补在 dim1
+            dt = F.pad(dt, (0, 0, 0, pad, 0, 0))          # dt: (B,L,H) 补在 dim1
+            dA_step = F.pad(dA_step, (0, 0, 0, pad, 0, 0))
+            B = F.pad(B, (0, 0, 0, 0, 0, pad, 0, 0))     # B: (B,L,G,N) 补在 dim1
+            C = F.pad(C, (0, 0, 0, 0, 0, pad, 0, 0))
+        Lp = L + pad
+        nc = Lp // chunk
+
+        # 切块: (B, L, H, P) -> (B, nc, chunk, H, P)
+        x_c = x.view(Bsz, nc, chunk, H, P)
+        dt_c = dt.view(Bsz, nc, chunk, H)
+        dA_c = dA_step.view(Bsz, nc, chunk, H)
+        B_c = B.view(Bsz, nc, chunk, H, N)
+        C_c = C.view(Bsz, nc, chunk, H, N)
+
+        # 块内累计 log 衰减: L_cum[i] = sum_{t<=i} log dA_step
+        # 位置 t 相对 s(<=t) 的衰减 = exp(L_cum[t] - L_cum[s])
+        L_cum = torch.cumsum(torch.log(dA_c.clamp_min(1e-8)), dim=2)  # (B, nc, chunk, H)
+        causal = torch.tril(torch.ones(chunk, chunk, device=x.device)).bool()
+
+        # 离散输入: dBx[t,h] = dt[t,h] * B[t,h] * x[t,h]; 逐头外积 -> (B,nc,chunk,H,N,P)
+        dBx = torch.einsum('bclh,bclhn,bclhp->bclhnp', dt_c, B_c, x_c)
+
+        # ---- 块内 (对角块): 逐头 SSM ----
+        # y[l,h,p] = sum_{s<=l} exp(L_l - L_s) * (C[l,h,n] . dBx[s,h,n,p])
+        # dBx: (B,nc,l,h,n,p) (源位置 l);  C_c: (B,nc,l,h,n) (查询位置 l);  两者共享块内索引 l, 但 einsum 需要区分源/查询,
+        # 故源位置记为 s、查询位置记为 l:
+        tmp = torch.einsum('bcshnp,bclhn->bclshp', dBx, C_c)        # (B,nc,l,s,h,p)
+        # decay(l, s) = exp(L_cum[l] - L_cum[s]) for s<=l else 0, 逐头
+        # L_cum: (B,nc,chunk,H)。query=l 放 index2、source=s 放 index3:
+        Lt, Ls = L_cum.unsqueeze(3), L_cum.unsqueeze(2)            # (B,nc,chunk,1,H)=query, (B,nc,1,chunk,H)=source
+        decay = torch.exp((Lt - Ls).float())                        # (B,nc,l, s, H) = exp(L_l - L_s)
+        decay = decay.masked_fill(~causal.view(1, 1, chunk, chunk, 1), 0.0)
+        y_intra = torch.einsum('bnlsh,bnslhp->bnlhp', decay, tmp)    # 对 s 求和 -> (B,nc,l,h,p)
+        # D 跳连
+        y_intra = y_intra + D.view(1, 1, 1, H, 1) * x_c
+
+        # ---- 块间 (off-diagonal 块): 逐块递归传递状态 ----
+        # running: 每块 *起始* 的状态 (B,H,P,N); 块内累计衰减 L_cum 相对块首=0
+        L_c = L_cum[:, :, -1, :]
+        if initial_state is not None:
+            running = initial_state.float()                            # (B, H, P, N)
+        else:
+            running = torch.zeros(Bsz, H, P, N, device=x.device)
+        y_off_all = torch.empty_like(y_intra)                          # (B,nc,l,h,p)
+        for c in range(nc):
+            exp_Lc = torch.exp(L_c[:, c, :])                           # (B, H) 块c累计衰减
+            # 块起始状态对本块各位置: y_off[l,h,p] = exp(L_cum[l]) * sum_n C[l,h,n]*running[h,p,n]
+            C_c_ = C_c[:, c, :, :, :]                                  # (B,chunk,H,N)
+            y_off = torch.einsum('blhn,bhpn->blhp', C_c_, running)    # (B,chunk,h,p)
+            y_off = y_off * torch.exp(L_cum[:, c, :].float()).unsqueeze(-1)  # 前向衰减 相对块首
+            y_off_all[:, c] = y_off
+            # 更新为 *下一块* 起始状态: end(c) = exp(L_c)*start(c) + sum_s exp(L_c - L_s)*dBx[c,s]
+            pos_decay = torch.exp((L_c[:, c, :].unsqueeze(1) - L_cum[:, c, :]).float())  # (B,chunk,H)
+        # contrib = sum_s pos[s]*dBx[c,s] -> (B,H,P,N); pos 与 dBx 共享块内位置 s, 用同一字母
+            contrib = torch.einsum('bsh,bshnp->bhnp', pos_decay, dBx[:, c]).permute(0, 1, 3, 2)  # (B,H,P,N)
+            running = running * exp_Lc.view(Bsz, H, 1, 1) + contrib
+        final_state = running.to(B.dtype)
+
+        out = (y_intra + y_off_all).view(Bsz, Lp, H, P)[:, :L, :, :]
+        return out, final_state
+
+    def forward(self, hidden_states, position_embeddings=None, past_key_value=None, use_cache=False, attention_mask=None):
+        B, L, _ = hidden_states.shape
+        # 1. 投影
+        projected = self.in_proj(hidden_states)
+        gate, conv_bc, dt = projected.split(
+            [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1)
+        # dt: (B, L, H) -> (B, H, L) 加可学习偏置 (对齐到 H 维), 再转回 (B, L, H)
+        dt = dt.transpose(1, 2) + self.dt_bias.view(1, -1, 1)
+        dt = dt.transpose(1, 2)
+
+        # 2. 因果 conv1d (对 BC 段); 生成阶段 L==1 用更快的增量路径
+        conv_state = past_key_value[0] if past_key_value is not None else None
+        conv_input = conv_bc.transpose(1, 2).to(self.conv1d.weight.dtype)  # (B, conv_dim, L)
+        if L == 1:
+            if conv_state is None:
+                conv_state = torch.zeros(B, self.conv_dim, self.conv_kernel - 1,
+                                         device=conv_input.device, dtype=conv_input.dtype)
+            conv_out = self._causal_conv1d_update(conv_input, conv_state)   # (B, conv_dim, 1)
+            new_conv_state = conv_state
+        else:
+            conv_out, new_conv_state = self._causal_conv1d(conv_input, conv_state)
+            conv_out = self.act(conv_out)
+        conv_out = conv_out.transpose(1, 2)  # (B, L, conv_dim)
+
+        # 3. 拆出 x, C, B
+        x, C, Bv = conv_out.split(
+            [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size], dim=-1)
+        x = x.view(B, L, self.num_heads, self.head_dim)
+        C = C.view(B, L, self.n_groups, self.ssm_state_size)
+        Bv = Bv.view(B, L, self.n_groups, self.ssm_state_size)
+
+        A = -torch.exp(self.A_log.float())
+
+        # 4. SSM 扫描: L==1 一律走递归增量 (state 缺失时按 0 起), 其余走分块并行
+        recurrent_state = past_key_value[1] if past_key_value is not None else None
+        if L == 1:
+            out, final_state = self._recurrent_update(
+                recurrent_state if recurrent_state is not None else
+                torch.zeros(B, self.num_heads, self.head_dim, self.ssm_state_size, device=x.device, dtype=x.dtype),
+                x, dt, A, Bv, C, self.D)
+        else:
+            out, final_state = self._chunk_scan(
+                x, dt, A, Bv, C, self.D, initial_state=recurrent_state)
+
+        # 5. 门控 RMSNorm + 输出投影
+        out = out.view(B, L, self.intermediate_size)
+        out = self.norm(out, gate)
+        out = self.out_proj(out)
+
+        past_kv = (new_conv_state, final_state) if use_cache else None
+        return out, past_kv
+
+    def _recurrent_update(self, state, x, dt, A, B, C, D):
+        """
+        逐 token 递归 (生成阶段, L=1)。
+        state: (B, H, P, N); x: (B, 1, H, P); dt: (B, 1, H); B,C: (B, 1, G, N)。
+        返回 (out (B, 1, H, P), new_state (B, H, P, N))
+        """
+        Bsz, H, P = x.shape[0], self.num_heads, self.head_dim
+        N = state.shape[-1]
+        G = B.shape[2]
+
+        # 去掉时间维
+        x = x.squeeze(1)                       # (B, H, P)
+        dt = dt.squeeze(1)                    # (B, H)
+        B_ = B.squeeze(1)                     # (B, G, N)
+        C_ = C.squeeze(1)                     # (B, G, N)
+
+        # 组 -> 头 广播
+        if G != H:
+            B_ = B_.repeat_interleave(H // G, dim=1)   # (B, H, N)
+            C_ = C_.repeat_interleave(H // G, dim=1)  # (B, H, N)
+        B_ = B_.view(Bsz, H, N)
+        C_ = C_.view(Bsz, H, N)
+
+        # dt 离散化
+        dt = F.softplus(dt)
+        dt = torch.clamp(dt, min=self.config.time_step_min, max=self.config.time_step_max)
+        dA = torch.exp((dt * A.view(1, H)).float())   # (B, H)
+
+        # 状态更新: s_new[h,p,n] = dA[h] * s[h,p,n] + dt[h] * B[h,n] * x[h,p]
+        #   s: (B,H,P,N), x: (B,H,P), B_: (B,H,N), dt/dA: (B,H)
+        dBx = torch.einsum('bh,bhn,bhp->bhpn', dt, B_, x)         # (B,H,P,N)
+        new_state = state * dA.view(Bsz, H, 1, 1) + dBx
+        new_state = new_state.to(state.dtype)
+
+        # 输出: y = C . s_new + D * x
+        out = torch.einsum('bhn,bhpn->bhp', C_.float(), new_state.float())
+        if D is not None:
+            out = out + x.float() * D.view(1, H, 1)
+        out = out.to(x.dtype).unsqueeze(1)  # (B, 1, H, P)
+        return out, new_state
+
+
+class _GatedRMSNorm(nn.Module):
+    """Zamba2 风格: 对 (x) 做 RMSNorm 后与 gate 逐元素相乘。"""
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x, gate):
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight * (x * rms)).type_as(x) * _silu(gate)
+
+
+# ==============================================================================
 # Transformer 块和完整模型
 # ==============================================================================
 
@@ -425,8 +723,16 @@ class MiniMindBlock(nn.Module):
     """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
-        self.self_attn = Attention(config)
-        # Attention 前的 LayerNorm
+        # 根据 config.layer_types[layer_id] 选择本层的 mixer:
+        #   "linear_attention" -> MambaMixer (Mamba2 选择性 SSM, 线性复杂度)
+        #   "full_attention"   -> Attention (标准 GQA)
+        self.layer_type = config.layer_types[layer_id]
+        if self.layer_type == "linear_attention":
+            self.mixer = MambaMixer(config)
+        else:
+            self.mixer = Attention(config)
+        self.self_attn = self.mixer  # 保持旧属性名兼容
+        # mixer 前的 LayerNorm (Pre-Norm)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # MLP 前的 LayerNorm
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -434,7 +740,7 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        # 1. 自注意力子层 (带残差连接)
+        # 1. mixer 子层 (带残差连接): 线性注意力 / 全注意力
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),  # Pre-Norm
@@ -505,11 +811,19 @@ class MiniMindModel(nn.Module):
         # 处理 HuggingFace 特定格式的 past_key_values
         if hasattr(past_key_values, 'layers'): past_key_values = None
 
-        # 初始化 KV Cache 列表 (如果未提供)
+        # 初始化每层缓存 (如果未提供)
         past_key_values = past_key_values or [None] * len(self.layers)
 
-        # 计算起始位置 (用于 KV Cache)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        # 计算起始位置 (用于 RoPE 位置编码)。
+        # 全注意力层的 KV 缓存是 (k, v) 元组, 其序列维即已生成长度;
+        # 而 Mamba 层缓存的 shape 不含有效位置信息, 因此从任一全注意力层取:
+        #   present_i = (k, v)          注意力层
+        #   present_i = (conv_state, recurrent_state)  Mamba 层
+        start_pos = 0
+        for layer, pkv in zip(self.layers, past_key_values):
+            if layer.layer_type == "full_attention" and pkv is not None:
+                start_pos = pkv[0].shape[1]
+                break
 
         # Token 嵌入
         hidden_states = self.dropout(self.embed_tokens(input_ids))
