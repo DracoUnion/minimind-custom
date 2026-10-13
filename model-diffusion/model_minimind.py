@@ -1,21 +1,27 @@
 """
-MiniMind 语言模型实现
+MiniMind Block Diffusion 语言模型实现
 
-基于Transformer架构的轻量级语言模型，支持:
-- RMSNorm 层归一化
-- RoPE (旋转位置编码)
-- GQA (分组查询注意力)
-- SwiGLU 激活函数
-- MoE (混合专家模型)
-- YaRN 长度外推
+基于 DiffusionGemma 的 encoder-decoder diffusion 架构改造而成，支持:
+- Encoder: 编码 prefix (自回归注意力, 写入共享 KV cache)
+- Decoder: 处理 canvas tokens (双向注意力, 只读 encoder 的 KV cache)
+- Self-Conditioning: 用上一步去噪的 logits 生成 soft embedding 注入 decoder
+- RMSNorm / RoPE / GQA / SwiGLU / MoE / YaRN
+
+参考: transformers/models/diffusion_gemma/modeling_diffusion_gemma.py
+
+训练约定:
+    model(input_ids, labels) 时, 输入序列尾部 `config.canvas_length` 个 token 作为
+    canvas(去噪目标), 前面部分作为 prefix(由 encoder 编码)。loss 默认在 canvas 上
+    计算双向预测交叉熵; 若 `config.use_prefix_ar_loss=True`, 额外叠加 prefix 的
+    自回归损失 (类似 DiffusionGemma 的 encoder AR loss)。
 """
 import math, torch, torch.nn.functional as F
 from torch import nn
+from dataclasses import dataclass
 from einops import rearrange, repeat
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
-from transformers.generation.utils import LogitsProcessorList
 from .config_minimind import MiniMindConfig
 
 
@@ -31,16 +37,16 @@ class RMSNorm(torch.nn.Module):
     output = x / RMS(x) * gamma
     其中 RMS(x) = sqrt(mean(x^2) + eps)
 
-    优点:
-    1. 计算更简单高效 (少一次均值计算)
-    2. 在语言模型任务上表现与 LayerNorm 相当甚至更好
+    支持 `with_scale=False` (无学习缩放参数), 用于 self-conditioning 的输出归一化。
     参考论文: https://arxiv.org/abs/1910.07467
     """
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-5, with_scale: bool = True):
         super().__init__()
-        self.eps = eps  # 防止除零的小常数
-        # 可学习的缩放参数，初始化为全1
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+        self.with_scale = with_scale
+        if with_scale:
+            # 可学习的缩放参数，初始化为全1
+            self.weight = nn.Parameter(torch.ones(dim))
 
     def norm(self, x):
         """
@@ -52,7 +58,24 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         # 先转为 float32 保证数值稳定性，计算完再转回原类型
-        return (self.weight * self.norm(x.float())).type_as(x)
+        normed = self.norm(x.float())
+        if self.with_scale:
+            normed = normed * self.weight.float()
+        return normed.type_as(x)
+
+
+class ScaledWordEmbedding(nn.Embedding):
+    """
+    带缩放因子的词嵌入 (对应 DiffusionGemma 的 DiffusionGemmaTextScaledWordEmbedding)。
+    embedding 输出乘以 `hidden_size ** 0.5`, 使得 soft-embedding (softmax(logits) @ weight)
+    与 token embedding 处于同一量级, self-conditioning 才能正确叠加。
+    """
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx=None, embed_scale: float = 1.0):
+        super().__init__(num_embeddings, embedding_dim, padding_idx)
+        self.embed_scale = embed_scale
+
+    def forward(self, input_ids: torch.Tensor):
+        return super().forward(input_ids) * self.embed_scale
 
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
@@ -172,11 +195,16 @@ class Attention(nn.Module):
     """
     多头自注意力层 (支持 GQA)
 
+    该层同时用于 Encoder 和 Decoder, 通过 `is_causal` 区分两种模式:
+    - Encoder (is_causal=True):  自回归因果注意力, 写入 KV cache
+    - Decoder (is_causal=False): 双向注意力, 读取 encoder 的 KV cache (prefix),
+      将其与当前 canvas 的 KV 拼接后计算注意力, 不更新 cache
+
     架构:
     1. 线性投影: Q, K, V 分别投影
     2. RMSNorm: 对 Q 和 K 进行归一化 (Query/Key Norm)
     3. RoPE: 应用旋转位置编码
-    4. KV Cache: 支持推理时的缓存
+    4. KV Cache: encoder 写入 / decoder 只读
     5. 注意力计算: Flash Attention 或手动实现
     6. 输出投影
     """
@@ -212,20 +240,24 @@ class Attention(nn.Module):
         # 是否使用 Flash Attention (PyTorch 2.0+ 原生支持)
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, x, position_embeddings, attention_mask=None, past_key_value=None,
+                use_cache=False, is_causal=True):
         """
         前向传播
 
         参数:
             x: 输入，形状 (batch_size, seq_len, hidden_size)
             position_embeddings: (cos, sin) 位置编码
-            past_key_value: 缓存的 K, V (用于自回归生成)
-            use_cache: 是否缓存 K, V
             attention_mask: 注意力掩码
+            past_key_value: (k, v) KV 缓存
+                - Encoder 模式: 已有 prefix KV, 新的 KV 拼接到尾部, 并随 use_cache 返回
+                - Decoder 模式: encoder 写入的 prefix KV, 只读拼接, 不返回
+            use_cache: 是否返回更新后的 K, V 缓存 (仅 encoder)
+            is_causal: 是否使用因果掩码 (decoder 为 False, 即双向)
 
         返回:
             output: 注意力输出
-            past_kv: 更新后的 K, V 缓存
+            past_kv: 更新后的 K, V 缓存 (decoder 返回 None)
         """
         bsz, seq_len, _ = x.shape
 
@@ -241,15 +273,19 @@ class Attention(nn.Module):
 
         # 3. 应用旋转位置编码 (RoPE)
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        # encoder 的 cos/sin 是 2D (seq, head_dim); decoder 的 cos/sin 是带 batch 维的
+        # 3D (batch, seq, head_dim), 需要不同的 unsqueeze 维度以正确广播
+        unsqueeze_dim = 2 if cos.ndim == 3 else 1
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin, unsqueeze_dim=unsqueeze_dim)
 
-        # 4. 拼接 KV Cache (如果存在)
+        # 4. KV Cache
+        #    encoder: 拼接到已有 cache 尾部 (自回归)
+        #    decoder: 拼接 encoder 的 prefix KV + 当前 canvas KV (双向, 只读)
         if past_key_value is not None:
-            # 将新的 K, V 拼接到缓存的 K, V 后面
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
 
-        # 保存当前的 K, V 用于返回
+        # decoder 不写 cache (只读 encoder 的 prefix KV)
         past_kv = (xk, xv) if use_cache else None
 
         # 5. 调整维度顺序以便计算注意力
@@ -259,19 +295,25 @@ class Attention(nn.Module):
         xv = rearrange(repeat_kv(xv, self.n_rep), 'b s h d -> b h s d')
 
         # 6. 注意力计算
-        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        #    Flash 路径: 仅用于无 cache 且因果 (encoder 预填充) 的情形,
+        #    decoder 有 prefix cache 且双向, 走手动路径
+        if self.flash and is_causal and (seq_len > 1) and (past_key_value is None) and \
+                (attention_mask is None or torch.all(attention_mask == 1)):
             # 使用 Flash Attention (内存高效、计算更快)
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             # 手动实现注意力
             # Q @ K^T / sqrt(d_k)
             scores = (xq @ rearrange(xk, 'b h s d -> b h d s')) / math.sqrt(self.head_dim)
-            # 应用因果掩码 (causal mask): 每个位置只能看到自己和之前的位置
+            # 因果掩码 (仅 encoder): 每个位置只能看到自己和之前的位置
             # triu(1) 创建上三角矩阵，对角线以上全为 -inf
-            scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+            if is_causal:
+                scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             # 应用额外的 attention_mask (如果有)
+            # (b, s) => (b, 1, 1, s), s 覆盖 prefix+canvas 总长度 (decoder 时)
             if attention_mask is not None:
-                # (b, s) => (b, 1, 1, s)
+                if attention_mask.dtype == torch.bool:
+                    attention_mask = attention_mask.to(scores.dtype)
                 scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
             # softmax 归一化后与 V 相乘
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
@@ -419,9 +461,8 @@ class MiniMindBlock(nn.Module):
     input → RMSNorm → Attention → +residual →
     RMSNorm → MLP (FFN/MoE) → +residual → output
 
-    Pre-Norm vs Post-Norm:
-    - Pre-Norm: LayerNorm 在残差连接之前，训练更稳定 (现代 LLM 常用)
-    - Post-Norm: LayerNorm 在残差连接之后
+    Encoder 与 Decoder 共享同一组层的权重, 通过 `is_causal` 在 forward 时切换
+    因果 / 双向注意力。
     """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -433,13 +474,17 @@ class MiniMindBlock(nn.Module):
         # 根据配置选择标准 FFN 或 MoE
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, attention_mask=None,
+                past_key_value=None, use_cache=False, is_causal=True):
         # 1. 自注意力子层 (带残差连接)
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),  # Pre-Norm
             position_embeddings,
-            past_key_value, use_cache, attention_mask
+            attention_mask,
+            past_key_value,
+            use_cache,
+            is_causal,
         )
         hidden_states += residual  # 残差连接
 
@@ -451,26 +496,65 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
 
-class MiniMindModel(nn.Module):
+class SelfConditioning(nn.Module):
     """
-    MiniMind 基础模型 (不含语言模型头)
+    Self-conditioning 模块 (对应 DiffusionGemma 的 DiffusionGemmaSelfConditioning)。
 
-    架构:
-    1. Token Embedding
-    2. 多个 Transformer Block 堆叠
-    3. 最终 RMSNorm
+    将上一轮去噪输出的 logits 转换出的 soft-embedding 处理成一个
+    self-conditioning 信号, 叠加到 decoder 的输入 embedding 上。
+
+    使用 SwiGLU 门控结构, 带 pre/post RMSNorm。
     """
     def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        self.pre_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        # post_norm 不学习缩放 (参考 DiffusionGemma: with_scale=False)
+        self.post_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps, with_scale=False)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, inputs_embeds, self_conditioning_signal):
+        """
+        参数:
+            inputs_embeds: 当前 canvas 的 token embedding
+                (batch_size, canvas_length, hidden_size)
+            self_conditioning_signal: 上一轮 logits 的 soft-embedding
+                (batch_size, canvas_length, hidden_size), 形状与 inputs_embeds 相同
+
+        返回:
+            叠加了 self-conditioning 信号后的 embedding, 形状不变
+        """
+        normed = self.pre_norm(self_conditioning_signal)
+        sc_signal = self.down_proj(self.act_fn(self.gate_proj(normed)) * self.up_proj(normed))
+        combined = inputs_embeds + sc_signal
+        return self.post_norm(combined)
+
+
+class MiniMindEncoderModel(nn.Module):
+    """
+    MiniMind 编码器模型 (对应 DiffusionGemma 的 DiffusionGemmaEncoderTextModel)
+
+    以自回归 (因果) 注意力编码 prefix tokens, 并把每层的 K/V 写入共享 KV cache,
+    供 decoder 读取。Encoder 与 Decoder 共享同一组层权重。
+    """
+    def __init__(self, config: MiniMindConfig, embed_tokens=None, layers=None):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
 
-        # Token 嵌入层
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # 词嵌入 (与 decoder / lm_head 共享权重)
+        self.embed_tokens = embed_tokens or ScaledWordEmbedding(
+            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size ** 0.5
+        )
         self.dropout = nn.Dropout(config.dropout)
 
-        # Transformer 块堆叠
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        # Transformer 块堆叠 (与 decoder 共享同一份 ModuleList)
+        self.layers = layers or nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
 
         # 最终的 LayerNorm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -485,30 +569,27 @@ class MiniMindModel(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False):
         """
-        前向传播
+        前向传播: 编码 prefix, 写 KV cache
 
         参数:
-            input_ids: 输入 token IDs，形状 (batch, seq_len)
+            input_ids: prefix token IDs, 形状 (batch, seq_len)
             attention_mask: 注意力掩码
-            past_key_values: 缓存的 K, V 列表 (用于自回归生成)
-            use_cache: 是否使用 KV Cache
+            past_key_values: 缓存的 K, V 列表
+            use_cache: 是否返回更新后的 KV cache (decoder 需要)
 
         返回:
-            hidden_states: 最后的隐藏状态
-            presents: 更新后的 K, V 缓存列表
+            hidden_states: prefix 的最终隐藏状态 (用于可选的 encoder AR loss)
+            presents: 更新后的 KV cache 列表, 每层为 (k, v)
             aux_loss: MoE 辅助损失 (如果有)
         """
         batch_size, seq_length = input_ids.shape
 
-        # 处理 HuggingFace 特定格式的 past_key_values
-        if hasattr(past_key_values, 'layers'): past_key_values = None
-
         # 初始化 KV Cache 列表 (如果未提供)
         past_key_values = past_key_values or [None] * len(self.layers)
 
-        # 计算起始位置 (用于 KV Cache)
+        # 计算起始位置 (用于 KV Cache / RoPE 索引)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         # Token 嵌入
@@ -520,15 +601,16 @@ class MiniMindModel(nn.Module):
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
 
-        # 逐层前向传播
+        # 逐层前向传播 (encoder: 因果注意力)
         presents = []
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
+                attention_mask=attention_mask,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
-                attention_mask=attention_mask
+                is_causal=True,
             )
             presents.append(present)
 
@@ -541,13 +623,238 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
+class MiniMindDecoderModel(nn.Module):
+    """
+    MiniMind 解码器模型 (对应 DiffusionGemma 的 DiffusionGemmaDecoderModel)
+
+    处理 canvas tokens: 双向自注意力 + 交叉注意力 (只读 encoder 的 KV cache)。
+    Decoder 不更新 KV cache, 一次处理整个 canvas (block diffusion)。
+
+    Encoder 与 Decoder 共享同一组层权重; decoder 额外拥有 self-conditioning 模块。
+    """
+    def __init__(self, config: MiniMindConfig, embed_tokens=None, layers=None):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+
+        # 词嵌入 (与 encoder / lm_head 共享权重)
+        self.embed_tokens = embed_tokens or ScaledWordEmbedding(
+            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size ** 0.5
+        )
+        self.dropout = nn.Dropout(config.dropout)
+
+        # Transformer 块堆叠 (与 encoder 共享同一份 ModuleList)
+        self.layers = layers or nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+
+        # 最终的 LayerNorm
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Self-conditioning 模块
+        self.self_conditioning = SelfConditioning(config)
+
+        # 预计算 RoPE 位置编码并注册为 buffer (不参与训练，持久化保存)
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim=config.head_dim,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, decoder_input_ids, past_key_values=None,
+                self_conditioning_logits=None, self_conditioning_mask=None,
+                decoder_attention_mask=None, decoder_position_ids=None):
+        """
+        前向传播: 处理 canvas, 双向注意力 + 交叉注意力 (只读 encoder KV cache)
+
+        参数:
+            decoder_input_ids: canvas token IDs, 形状 (batch, canvas_length)
+            past_key_values: encoder 写入的共享 KV cache (list of (k, v), 每层一个)
+                - 若为 None, 则退化为无 prefix 的纯双向注意力 (纯去噪)
+            self_conditioning_logits: 上一轮去噪的 logits
+                (batch, canvas_length, vocab_size), 用于计算 self-conditioning embedding
+            self_conditioning_mask: (batch,) bool mask, False 表示该样本不使用 self-conditioning
+            decoder_attention_mask: 覆盖 prefix+canvas 总长度的掩码 (batch, prefix_len+canvas_len)
+            decoder_position_ids: canvas 的位置 id (默认从 prefix 长度起算)
+
+        返回:
+            hidden_states: canvas 的最终隐藏状态, 形状 (batch, canvas_length, hidden_size)
+        """
+        inputs_embeds = self.dropout(self.embed_tokens(decoder_input_ids))
+
+        # 处理 self-conditioning:
+        # 如果传入了上一轮 logits, 用 softmax 后的概率对词表加权得到 soft-embedding
+        if self_conditioning_logits is not None:
+            # logits 转 soft-embedding: softmax(logits) @ embed_weight
+            soft_embeddings = torch.matmul(
+                self_conditioning_logits.softmax(dim=-1, dtype=torch.float32).to(self.embed_tokens.weight.dtype),
+                self.embed_tokens.weight,
+            ) * self.embed_tokens.embed_scale
+            # 按样本决定是否启用 self-conditioning
+            if self_conditioning_mask is not None:
+                soft_embeddings = soft_embeddings * self_conditioning_mask.to(soft_embeddings.dtype)[:, None, None]
+        else:
+            # 第一轮去噪没有前一轮 logits, self-conditioning 信号置零
+            soft_embeddings = torch.zeros_like(inputs_embeds)
+
+        # 将 self-conditioning 信号注入 decoder 输入 embedding
+        inputs_embeds = self.self_conditioning(inputs_embeds, soft_embeddings)
+
+        # Canvas 的位置在 prefix 之后, 即 [prefix_len, prefix_len+canvas_len)
+        if past_key_values is not None and past_key_values[0] is not None:
+            cache_seq_length = past_key_values[0][0].shape[1]
+        else:
+            cache_seq_length = 0
+
+        canvas_length = inputs_embeds.shape[1]
+        if decoder_position_ids is None:
+            decoder_position_ids = torch.arange(
+                cache_seq_length,
+                cache_seq_length + canvas_length,
+                device=inputs_embeds.device,
+                dtype=torch.long,
+            )
+            decoder_position_ids = decoder_position_ids.unsqueeze(0)
+
+        # 获取 canvas 的位置编码 (从 prefix 长度起算)
+        position_embeddings = (
+            self.freqs_cos[decoder_position_ids],
+            self.freqs_sin[decoder_position_ids],
+        )
+
+        # 逐层前向传播 (decoder: 双向注意力, 只读 encoder KV cache)
+        hidden_states = inputs_embeds
+        for layer, past_key_value in zip(self.layers, past_key_values if past_key_values is not None else [None] * len(self.layers)):
+            hidden_states, _ = layer(
+                hidden_states,
+                position_embeddings,
+                attention_mask=decoder_attention_mask,
+                past_key_value=past_key_value,
+                use_cache=False,  # decoder 不写 cache
+                is_causal=False,  # 双向
+            )
+
+        # 最终归一化
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+
+
+@dataclass
+class MiniMindDiffusionOutputWithPast(MoeCausalLMOutputWithPast):
+    """
+    MiniMind diffusion 模型的输出。
+
+    继承 MoeCausalLMOutputWithPast 以兼容训练脚本 (res.loss / res.aux_loss),
+    额外携带 encoder 的最终隐藏状态 (用于可选的 prefix 自回归损失)。
+    """
+    encoder_last_hidden_state: torch.FloatTensor | None = None
+
+
+class MiniMindModel(nn.Module):
+    """
+    MiniMind diffusion 模型 (对应 DiffusionGemma 的 DiffusionGemmaModel)
+
+    结构:
+    - Encoder: 编码 prefix → 共享 KV cache
+    - Decoder: 双向处理 canvas → 交叉注意力到 encoder KV cache
+    - Encoder 与 Decoder 共享同一组 Transformer 层权重
+    """
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+
+        # Encoder 与 Decoder 共享的词嵌入
+        self.embed_tokens = ScaledWordEmbedding(
+            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size ** 0.5
+        )
+        # Encoder 与 Decoder 共享的 Transformer 层
+        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+
+        self.encoder = MiniMindEncoderModel(config, self.embed_tokens, self.layers)
+        self.decoder = MiniMindDecoderModel(config, self.embed_tokens, self.layers)
+
+    def forward(self, input_ids=None, attention_mask=None, past_key_values=None,
+                decoder_input_ids=None, self_conditioning_logits=None,
+                self_conditioning_mask=None, decoder_attention_mask=None,
+                decoder_position_ids=None, use_cache=True, **kwargs):
+        """
+        前向传播
+
+        参数:
+            input_ids: prefix token IDs, 形状 (batch, prefix_len)
+                (解码器需要; 若为 None, 则必须提供 past_key_values)
+            attention_mask: prefix 的注意力掩码
+            past_key_values: 共享 KV cache (encoder 写入, decoder 只读)
+            decoder_input_ids: canvas token IDs, 形状 (batch, canvas_length)
+            self_conditioning_logits / mask: 上一轮 logits 及逐样本开关
+            decoder_attention_mask: 覆盖 prefix+canvas 的掩码
+            decoder_position_ids: canvas 位置 id
+            use_cache: 是否由 encoder 写 cache (默认 True)
+
+        返回:
+            last_hidden_state: canvas 的最终隐藏状态
+            past_key_values: encoder 写好的共享 KV cache
+            encoder_last_hidden_state: prefix 的最终隐藏状态 (用于可选 AR loss)
+            aux_loss: MoE 辅助损失
+        """
+        kwargs.pop("use_cache", None)
+
+        # 1. Encoder: 把 prefix 编码进共享 KV cache (decoder 只读)
+        encoder_last_hidden_state = None
+        aux_loss = None
+        if input_ids is not None:
+            encoder_last_hidden_state, past_key_values, aux_loss = self.encoder(
+                input_ids, attention_mask, past_key_values, use_cache=True
+            )
+        elif past_key_values is None:
+            # 允许无 prefix 的纯 decoder diffusion: decoder 使用双向 self-attention
+            # 此时没有 encoder KV cache, past_key_values 保持 None
+            aux_loss = torch.zeros((), device=self.embed_tokens.weight.device)
+
+        # 2. Decoder: 处理 canvas (双向 + 交叉注意力)
+        # 如果未显式提供 canvas, 随机采样初始化 (block diffusion 的第一步)
+        if decoder_input_ids is None:
+            decoder_input_ids = torch.randint(
+                low=0,
+                high=self.config.vocab_size,
+                size=(input_ids.shape[0], self.config.canvas_length),
+                device=self.encoder.device,
+            )
+
+        last_hidden_state = self.decoder(
+            decoder_input_ids=decoder_input_ids,
+            past_key_values=past_key_values,
+            self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_mask=self_conditioning_mask,
+            decoder_attention_mask=decoder_attention_mask,
+            decoder_position_ids=decoder_position_ids,
+        )
+
+        return MiniMindDiffusionOutputWithPast(
+            loss=None,
+            aux_loss=aux_loss,
+            logits=None,
+            past_key_values=past_key_values,
+            hidden_states=last_hidden_state,
+            encoder_last_hidden_state=encoder_last_hidden_state,
+        )
+
+
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     """
-    MiniMind 因果语言模型 (用于文本生成)
+    MiniMind Block Diffusion 语言模型 (对应 DiffusionGemmaForBlockDiffusion)
 
     继承:
     - PreTrainedModel: HuggingFace Transformers 基类，支持 save_pretrained/load_pretrained
-    - GenerationMixin: 支持 generate() 方法进行文本生成
+    - GenerationMixin: 支持 generate() 方法进行去噪生成
+
+    训练时直接调用 `model(input_ids, labels=labels)`:
+    - input_ids 尾部 `canvas_length` 个 token 作为 canvas (去噪目标)
+    - 前面部分作为 prefix 交给 encoder
+    - loss 在 canvas 上计算双向预测交叉熵; 可选叠加 prefix 的自回归损失
     """
     config_class = MiniMindConfig
 
@@ -555,168 +862,218 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
 
-        # 基础模型
+        # 基础模型 (encoder + decoder)
         self.model = MiniMindModel(self.config)
 
         # 语言模型头: 将隐藏状态映射到词表
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
-        # 权重绑定: 输入嵌入和输出投影共享权重
-        # 减少参数量，提升性能
+        # 权重绑定: 输入嵌入和输出投影共享权重 (soft-embedding 也基于该权重)
         self.model.embed_tokens.weight = self.lm_head.weight
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
+    def forward(self, input_ids, attention_mask=None, labels=None, past_key_values=None,
+                decoder_input_ids=None, self_conditioning_logits=None,
+                self_conditioning_mask=None, decoder_attention_mask=None,
+                decoder_position_ids=None, **kwargs):
         """
         前向传播
 
         参数:
-            input_ids: 输入 token IDs
-            attention_mask: 注意力掩码
-            past_key_values: KV Cache
-            use_cache: 是否使用缓存
-            logits_to_keep: 只保留最后 N 个 logits (用于节省内存)
-            labels: 目标标签 (用于计算 loss)
+            input_ids: 输入 token IDs (batch, seq_len)。
+                默认把尾部 `canvas_length` 个 token 作为 canvas, 前面作为 prefix。
+                若显式传入 `decoder_input_ids`, 则 input_ids 仅作为 prefix。
+            attention_mask: prefix 的注意力掩码
+            labels: 目标 token IDs, 形状与 input_ids 相同 (batch, seq_len)。
+                只有 canvas 部分 (尾部 canvas_length 个) 参与 diffusion loss;
+                prefix 部分可选参与自回归 loss。
+            decoder_input_ids: canvas token IDs (batch, canvas_length)。
+                不传时由 input_ids 自动切分。
+            self_conditioning_logits / mask: 上一轮去噪 logits 及逐样本开关
+            decoder_attention_mask: 覆盖 prefix+canvas 的掩码
+            decoder_position_ids: canvas 位置 id
 
         返回:
-            MoeCausalLMOutputWithPast 包含 loss, logits, past_key_values 等
+            MiniMindDiffusionOutputWithPast, 包含 loss, aux_loss, logits, hidden_states
         """
-        # 获取隐藏状态
-        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+        # 切分 prefix / canvas
+        if input_ids is not None:
+            seq_len = input_ids.shape[1]
+            canvas_len = min(self.config.canvas_length, seq_len)
+            prefix_len = seq_len - canvas_len
+        else:
+            # 纯去噪模式: 不编码 prefix, decoder 直接处理 canvas
+            canvas_len = decoder_input_ids.shape[1] if decoder_input_ids is not None else self.config.canvas_length
+            prefix_len = 0
+        auto_canvas = decoder_input_ids is None
 
-        # 计算 logits (如果只保留部分，切片)
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        if auto_canvas and input_ids is not None:
+            # 自动切分: prefix + canvas
+            prefix_ids = input_ids[:, :prefix_len] if prefix_len > 0 else None
+            decoder_input_ids = input_ids[:, -canvas_len:]
+            # 切分 mask: prefix 部分给 encoder, canvas 部分 (全1) 拼接到 decoder mask
+            if attention_mask is not None:
+                prefix_mask = attention_mask[:, :prefix_len] if prefix_len > 0 else None
+                canvas_mask = attention_mask.new_ones((attention_mask.shape[0], canvas_len))
+                if decoder_attention_mask is None:
+                    decoder_attention_mask = torch.cat([attention_mask[:, :prefix_len], canvas_mask], dim=-1)
+            else:
+                prefix_mask = None
+        elif auto_canvas:
+            raise ValueError("input_ids 和 decoder_input_ids 不能同时为 None")
+        else:
+            # 显式传入 canvas: input_ids 即 prefix (可能为 None)
+            prefix_ids = input_ids
+            prefix_mask = attention_mask
 
-        # 计算语言模型损失 (如果提供了 labels)
+        # 模型前向
+        outputs = self.model(
+            input_ids=prefix_ids,
+            attention_mask=prefix_mask,
+            past_key_values=past_key_values,
+            decoder_input_ids=decoder_input_ids,
+            self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_mask=self_conditioning_mask,
+            decoder_attention_mask=decoder_attention_mask,
+            decoder_position_ids=decoder_position_ids,
+        )
+
+        # 计算 logits (canvas 上的预测)
+        logits = self.lm_head(outputs.hidden_states)
+
+        # final logits softcapping (可选, 参考 DiffusionGemma)
+        if self.config.final_logit_softcapping is not None:
+            logits = logits / self.config.final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * self.config.final_logit_softcapping
+
+        # 计算损失
         loss = None
         if labels is not None:
-            # 移位: 预测下一个 token
-            # logits 去掉最后一个，labels 去掉第一个
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            # 展平后计算交叉熵
-            loss = F.cross_entropy(rearrange(x, 'b s v -> (b s) v'), rearrange(y, 'b s -> (b s)'), ignore_index=-100)
+            # 1) diffusion loss: canvas 上双向预测交叉熵
+            canvas_labels = labels[:, -canvas_len:] if auto_canvas else labels
+            loss = F.cross_entropy(
+                rearrange(logits, 'b s v -> (b s) v'),
+                rearrange(canvas_labels, 'b s -> (b s)'),
+                ignore_index=-100,
+            )
+            # 2) prefix 自回归损失 (可选): 类似 DiffusionGemma 的 encoder AR loss
+            if (self.config.use_prefix_ar_loss and prefix_ids is not None
+                    and outputs.encoder_last_hidden_state is not None):
+                enc_logits = self.lm_head(outputs.encoder_last_hidden_state)
+                prefix_labels = labels[:, :prefix_len]
+                x, y = enc_logits[..., :-1, :].contiguous(), prefix_labels[..., 1:].contiguous()
+                ar_loss = F.cross_entropy(
+                    rearrange(x, 'b s v -> (b s) v'),
+                    rearrange(y, 'b s -> (b s)'),
+                    ignore_index=-100,
+                )
+                loss = loss + ar_loss
 
-        return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        return MiniMindDiffusionOutputWithPast(
+            loss=loss,
+            aux_loss=outputs.aux_loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+        )
 
-    # 生成方法参考: https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()
-    def _generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
+    def generate(self, inputs=None, attention_mask=None, max_new_tokens=None,
+                 num_diffusion_steps=None, temperature=0.85, top_p=0.85, top_k=50,
+                 self_conditioning_prob=None, seed=None, **kwargs):
         """
-        自回归文本生成
+        Block diffusion 去噪采样
+
+        从随机初始化的 canvas 出发, 进行 `num_diffusion_steps` 轮去噪:
+        每轮用模型预测 logits 并重采样全部 canvas token (self-conditioning 可选),
+        最后一轮取 argmax 得到最终 canvas。
 
         参数:
-            inputs: 输入文本或 input_ids
-            attention_mask: 注意力掩码
-            max_new_tokens: 最大生成 token 数
-            temperature: 采样温度 (越高越随机)
+            inputs: input_ids (prefix tokens), 形状 (batch, prefix_len)
+            attention_mask: prefix 的注意力掩码
+            max_new_tokens: canvas 长度 (默认 config.canvas_length)
+            num_diffusion_steps: 去噪步数 (默认 config.num_diffusion_steps)
+            temperature: 采样温度
             top_p: 核采样概率阈值
             top_k: Top-K 采样
-            eos_token_id: 结束符 ID
-            streamer: 流式输出回调
-            use_cache: 使用 KV Cache (显著提升生成速度)
-            num_return_sequences: 生成序列数
-            do_sample: 是否采样 (False 则用贪婪解码)
-            repetition_penalty: 重复惩罚 (>1 降低重复)
+            self_conditioning_prob: 每步使用 self-conditioning 的概率
+            seed: 随机种子
 
         返回:
-            生成的 token IDs，形状 (batch*num_return_sequences, input_len+new_tokens)
+            完整序列 (prefix + canvas), 形状 (batch, prefix_len + canvas_len)
         """
-        if max_new_tokens is None:
-            max_new_tokens = 8192
-        # 处理输入
-        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
-        attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
-        past_key_values = kwargs.pop("past_key_values", None)
+        if seed is not None:
+            torch.manual_seed(seed)
 
-        # 标记已完成的序列 (遇到 EOS)
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        input_ids = kwargs.pop("input_ids", inputs)
+        device = input_ids.device
+        batch_size, prefix_len = input_ids.shape
+        canvas_len = max_new_tokens or self.config.canvas_length
+        num_diffusion_steps = num_diffusion_steps or self.config.num_diffusion_steps
+        sc_prob = self.config.self_conditioning_prob if self_conditioning_prob is None else self_conditioning_prob
 
-        # 流式输出初始输入
-        if streamer: streamer.put(input_ids.cpu())
+        # 初始 canvas: 从词表均匀随机采样
+        canvas = torch.randint(0, self.config.vocab_size, (batch_size, canvas_len), device=device)
+        prev_logits = None
 
-        # 自回归生成循环
-        for _ in range(max_new_tokens):
-            # 计算已有缓存长度
-            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
+        for step in range(num_diffusion_steps):
+            # self-conditioning: 除第一步和最后一步外, 以 sc_prob 概率使用上一轮 logits
+            if step > 0 and step < num_diffusion_steps - 1 and torch.rand(()) > sc_prob:
+                prev_logits = None
 
-            # 前向传播 (只传入新 token)
-            outputs = self.forward(input_ids[:, past_len:], attention_mask, past_key_values, use_cache=use_cache, **kwargs)
+            outputs = self.forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=canvas,
+                self_conditioning_logits=prev_logits,
+            )
+            logits = outputs.logits
+            prev_logits = logits.detach()
 
-            # 更新 attention_mask
-            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
+            # 最后一轮: 贪婪取 argmax
+            if step == num_diffusion_steps - 1:
+                canvas = logits.argmax(dim=-1)
+                continue
 
-            # 取最后一个位置的 logits 并应用温度
-            logits = outputs.logits[:, -1, :] / temperature
-
-            # 重复惩罚
-            if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]):
-                    # 对已经出现过的 token 降低其概率
-                    logits[i, torch.unique(input_ids[i])] /= repetition_penalty
+            # 采样
+            logits = logits / temperature
 
             # Top-K 采样
             if top_k > 0:
-                # 将不在 top-k 中的 logits 设为 -inf
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
 
             # Top-P (核) 采样
             if top_p < 1.0:
-                # 按概率降序排序
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                # 计算累积概率
                 cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                # 标记超过 top_p 的位置
                 mask = cum_probs > top_p
-                # 右移一位，确保至少保留第一个 token
                 mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
-                # 将 mask 中标记的位置设为 -inf
-                logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
+                logits[mask.scatter(-1, sorted_indices, mask)] = -float('inf')
 
-            # 采样或贪婪选择下一个 token
-            if do_sample:
-                probs = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            probs = torch.softmax(logits, dim=-1)
+            # multinomial 只支持 1D/2D, 展平 (batch, seq, vocab) -> (batch*seq, vocab) 后采样再恢复
+            canvas = torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1).squeeze(-1)
+            canvas = canvas.reshape(batch_size, canvas_len)
 
-            # 已完成的序列强制输出 EOS
-            if eos_token_id is not None:
-                next_token = torch.where(finished.unsqueeze(-1), next_token.new_full((next_token.shape[0], 1), eos_token_id), next_token)
-
-            # 追加到序列
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-
-            # 更新 KV Cache
-            past_key_values = outputs.past_key_values if use_cache else None
-
-            # 流式输出
-            if streamer: streamer.put(next_token.cpu())
-
-            # 检查是否所有序列都已完成
-            if eos_token_id is not None:
-                finished |= next_token.squeeze(-1).eq(eos_token_id)
-                if finished.all():
-                    break
-
-        if streamer: streamer.end()
-
-        if kwargs.get("return_kv"):
-            return {'generated_ids': input_ids, 'past_kv': past_key_values}
-        return input_ids
+        # 返回 prefix + canvas 的完整序列
+        return torch.cat([input_ids, canvas], dim=-1)
 
     @torch.inference_mode()
     def chat(model, tok, ques, history=[], **kw):
+        """对话接口: 以历史对话为 prefix, diffusion 去噪生成回复。"""
         iids = tok.apply_chat_template(
-            history + [{'role': 'user', 'content': ques}], 
+            history + [{'role': 'user', 'content': ques}],
             add_generation_prompt=1,
         )
+        iids = torch.tensor([iids]).to(model.device)
         oids = model.generate(
-            inputs=torch.tensor([iids]).to(model.device),
+            inputs=iids,
             **(model.generation_config.to_dict() | kw),
         )
         oids = oids[0][len(iids):].tolist()
         if oids[-1] == tok.eos_token_id:
             oids = oids[:-1]
         ans = tok.decode(oids)
-        
+
         return ans

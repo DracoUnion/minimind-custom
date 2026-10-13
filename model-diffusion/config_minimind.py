@@ -38,3 +38,14 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        ### Diffusion specific configs
+        # canvas 长度：训练时输入序列末尾取 canvas_length 个 token 作为去噪目标，前面作为 prefix 编码
+        self.canvas_length = kwargs.get("canvas_length", 64)
+        # 去噪步数（block diffusion 采样用）
+        self.num_diffusion_steps = kwargs.get("num_diffusion_steps", 16)
+        # 是否额外计算 prefix 部分的自回归损失（类似 DiffusionGemma 的 encoder AR loss）
+        self.use_prefix_ar_loss = kwargs.get("use_prefix_ar_loss", True)
+        # 采样时使用 self-conditioning 的概率（DiffusionGemma 中提到）
+        self.self_conditioning_prob = kwargs.get("self_conditioning_prob", 0.9)
+        # final logits softcapping（可选，None 表示不启用）
+        self.final_logit_softcapping = kwargs.get("final_logit_softcapping", None)
