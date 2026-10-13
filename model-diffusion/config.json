@@ -1,0 +1,13 @@
+{
+    "_name_or_path": "minimind/minimind",
+    "model_type": "minimind",
+    "architectures": [
+        "MiniMindModel"
+    ],
+    "auto_map": {
+        "AutoConfig": "config_minimind.MiniMindConfig",
+        "AutoModel": "model_minimind.MiniMindForCausalLM",
+        "AutoModelForCausalLM": "model_minimind.MiniMindForCausalLM",
+        "AutoModelForSeq2SeqLM": "model_minimind.MiniMindForCausalLM"
+    }
+}
